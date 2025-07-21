@@ -4,7 +4,6 @@
 package proxmoxclone
 
 import (
-	"crypto"
 	"net/netip"
 	"strings"
 
@@ -13,6 +12,7 @@ import (
 	proxmox "github.com/hashicorp/packer-plugin-proxmox/builder/proxmox/common"
 	"github.com/hashicorp/packer-plugin-sdk/multistep"
 	packersdk "github.com/hashicorp/packer-plugin-sdk/packer"
+	"golang.org/x/crypto/ssh"
 
 	"context"
 	"fmt"
@@ -53,7 +53,7 @@ func (b *Builder) Run(ctx context.Context, ui packersdk.Ui, hook packersdk.Hook)
 
 type cloneVMCreator struct{}
 
-func (*cloneVMCreator) Create(vmRef *proxmoxapi.VmRef, config proxmoxapi.ConfigQemu, state multistep.StateBag) error {
+func (*cloneVMCreator) Create(ctx context.Context, vmRef *proxmoxapi.VmRef, config proxmoxapi.ConfigQemu, state multistep.StateBag) error {
 	client := state.Get("proxmoxClient").(*proxmoxapi.Client)
 	c := state.Get("clone-config").(*Config)
 	comm := state.Get("config").(*proxmox.Config).Comm
@@ -122,10 +122,18 @@ func (*cloneVMCreator) Create(vmRef *proxmoxapi.VmRef, config proxmoxapi.ConfigQ
 		}
 	}
 
-	var publicKey []crypto.PublicKey
+	var publicKey []proxmoxapi.AuthorizedKey
 
 	if comm.SSHPublicKey != nil {
-		publicKey = append(publicKey, crypto.PublicKey(string(comm.SSHPublicKey)))
+		key, err := ssh.NewPublicKey(string(comm.SSHPublicKey))
+
+		if err != nil {
+			return err
+		}
+
+		publicKey = append(publicKey, proxmoxapi.AuthorizedKey{
+			PublicKey: key,
+		})
 	}
 
 	config.CloudInit = &proxmoxapi.CloudInit{
@@ -140,7 +148,7 @@ func (*cloneVMCreator) Create(vmRef *proxmoxapi.VmRef, config proxmoxapi.ConfigQ
 
 	var sourceVmr *proxmoxapi.VmRef
 	if c.CloneVM != "" {
-		sourceVmrs, err := client.GetVmRefsByName(c.CloneVM)
+		sourceVmrs, err := client.GetVmRefsByName(ctx, c.CloneVM)
 		if err != nil {
 			return err
 		}
@@ -153,18 +161,18 @@ func (*cloneVMCreator) Create(vmRef *proxmoxapi.VmRef, config proxmoxapi.ConfigQ
 			}
 		}
 	} else if c.CloneVMID != 0 {
-		sourceVmr = proxmoxapi.NewVmRef(c.CloneVMID)
-		err := client.CheckVmRef(sourceVmr)
+		sourceVmr = proxmoxapi.NewVmRef(proxmoxapi.GuestID(c.CloneVMID))
+		err := client.CheckVmRef(ctx, sourceVmr)
 		if err != nil {
 			return err
 		}
 	}
 
-	err := config.CloneVm(sourceVmr, vmRef, client)
+	err := config.CloneVm(ctx, sourceVmr, vmRef, client)
 	if err != nil {
 		return err
 	}
-	_, err = config.Update(false, vmRef, client)
+	_, err = config.Update(ctx, false, vmRef, client)
 	if err != nil {
 		return err
 	}

@@ -4,6 +4,7 @@
 package proxmox
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"strconv"
@@ -47,6 +48,7 @@ func (a *Artifact) State(name string) interface{} {
 
 func (a *Artifact) Destroy() error {
 	log.Printf("Destroying template: %d", a.templateID)
-	_, err := a.proxmoxClient.DeleteVm(proxmox.NewVmRef(a.templateID))
+	// Not sure it's a good idea to pass a context.Background here, but we have to comply to the API for now
+	_, err := a.proxmoxClient.DeleteVm(context.Background(), proxmox.NewVmRef(proxmox.GuestID(a.templateID)))
 	return err
 }

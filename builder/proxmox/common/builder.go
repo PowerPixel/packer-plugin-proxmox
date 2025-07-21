@@ -152,7 +152,7 @@ func getVMIP(state multistep.StateBag) (string, error) {
 	config := state.Get("config").(*Config)
 	vmRef := state.Get("vmRef").(*proxmox.VmRef)
 
-	ifs, err := client.GetVmAgentNetworkInterfaces(vmRef)
+	ifs, err := client.GetVmAgentNetworkInterfaces(context.TODO(), vmRef)
 	if err != nil {
 		return "", err
 	}

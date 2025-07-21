@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"reflect"
 	"slices"
 	"strconv"
@@ -27,7 +28,7 @@ type stepStartVM struct {
 }
 
 type ProxmoxVMCreator interface {
-	Create(*proxmox.VmRef, proxmox.ConfigQemu, multistep.StateBag) error
+	Create(context.Context, *proxmox.VmRef, proxmox.ConfigQemu, multistep.StateBag) error
 }
 type vmStarter interface {
 	CheckVmRef(vmr *proxmox.VmRef) (err error)
@@ -49,7 +50,7 @@ func getExistingTemplate(c *Config, client vmStarter) (*proxmox.VmRef, error) {
 	vmRef := &proxmox.VmRef{}
 	if c.VMID > 0 {
 		log.Printf("looking up VM with ID %d", c.VMID)
-		vmRef = proxmox.NewVmRef(c.VMID)
+		vmRef = proxmox.NewVmRef(proxmox.GuestID(c.VMID))
 		err := client.CheckVmRef(vmRef)
 		if err != nil {
 			// expect an error if no VM is found
@@ -78,7 +79,7 @@ func getExistingTemplate(c *Config, client vmStarter) (*proxmox.VmRef, error) {
 		if len(vmRefs) > 1 {
 			vmIDs := []int{}
 			for _, vmr := range vmRefs {
-				vmIDs = append(vmIDs, vmr.VmId())
+				vmIDs = append(vmIDs, int(vmr.VmId()))
 			}
 			return &proxmox.VmRef{}, fmt.Errorf("found multiple VMs with name '%s', IDs: %v", c.TemplateName, vmIDs)
 		}
@@ -119,6 +120,25 @@ func (s *stepStartVM) Run(ctx context.Context, state multistep.StateBag) multist
 		}
 	}
 
+	errs, warnings, pciDevices := generateProxmoxPCIDeviceMap(c.PCIDevices)
+	if errs != nil && len(errs.Errors) > 0 {
+		state.Put("error", errs)
+		ui.Error(errs.Error())
+		return multistep.ActionHalt
+	}
+	if len(warnings) > 0 {
+		for idx := range warnings {
+			ui.Sayf("Warning: %s", warnings[idx])
+		}
+	}
+
+	errs, nics := generateProxmoxNetworkAdapters(c.NICs)
+	if errs != nil && len(errs.Errors) > 0 {
+		state.Put("error", errs)
+		ui.Error(errs.Error())
+		return multistep.ActionHalt
+	}
+
 	var description = "Packer ephemeral build VM"
 
 	config := proxmox.ConfigQemu{
@@ -136,21 +156,21 @@ func (s *stepStartVM) Run(ctx context.Context, state multistep.StateBag) multist
 		Memory: &proxmox.QemuMemory{
 			CapacityMiB: (*proxmox.QemuMemoryCapacity)(&c.Memory),
 		},
-		QemuOs:         c.OS,
-		Bios:           c.BIOS,
-		EFIDisk:        generateProxmoxEfi(c.EFIConfig),
-		Machine:        c.Machine,
-		RNGDrive:       generateProxmoxRng0(c.Rng0),
-		TPM:            generateProxmoxTpm(c.TPMConfig),
-		QemuVga:        generateProxmoxVga(c.VGA),
-		QemuNetworks:   generateProxmoxNetworkAdapters(c.NICs),
-		Disks:          disks,
-		QemuPCIDevices: generateProxmoxPCIDeviceMap(c.PCIDevices),
-		Serials:        generateProxmoxSerials(c.Serials),
-		Scsihw:         c.SCSIController,
-		Onboot:         &c.Onboot,
-		Args:           c.AdditionalArgs,
-		Pool:           (*proxmox.PoolName)(&c.Pool),
+		QemuOs:     c.OS,
+		Bios:       c.BIOS,
+		EFIDisk:    generateProxmoxEfi(c.EFIConfig),
+		Machine:    c.Machine,
+		RNGDrive:   generateProxmoxRng0(c.Rng0),
+		TPM:        generateProxmoxTpm(c.TPMConfig),
+		QemuVga:    generateProxmoxVga(c.VGA),
+		Networks:   nics,
+		Disks:      disks,
+		PciDevices: pciDevices,
+		Serials:    generateProxmoxSerials(c.Serials),
+		Scsihw:     c.SCSIController,
+		Onboot:     &c.Onboot,
+		Args:       c.AdditionalArgs,
+		Pool:       (*proxmox.PoolName)(&c.Pool),
 	}
 
 	// 0 disables the ballooning device, which is useful for all VMs
@@ -184,6 +204,7 @@ func (s *stepStartVM) Run(ctx context.Context, state multistep.StateBag) multist
 
 	ui.Say("Creating VM")
 	var vmRef *proxmox.VmRef
+	var guestId proxmox.GuestID
 	for i := 1; ; i++ {
 		id := c.VMID
 		if id == 0 {
@@ -195,15 +216,16 @@ func (s *stepStartVM) Run(ctx context.Context, state multistep.StateBag) multist
 				return multistep.ActionHalt
 			}
 			id = genID
-			config.VmID = genID
+			guestId = proxmox.GuestID(genID)
+			config.ID = &guestId
 		}
-		vmRef = proxmox.NewVmRef(id)
+		vmRef = proxmox.NewVmRef(guestId)
 		vmRef.SetNode(c.Node)
 		if c.Pool != "" {
 			vmRef.SetPool(c.Pool)
 		}
 
-		err := s.vmCreator.Create(vmRef, config, state)
+		err := s.vmCreator.Create(ctx, vmRef, config, state)
 		if err == nil {
 			break
 		}
@@ -279,27 +301,64 @@ func generateTags(rawTags string) *[]proxmox.Tag {
 	return &tags
 }
 
-func generateProxmoxNetworkAdapters(nics []NICConfig) proxmox.QemuDevices {
-	devs := make(proxmox.QemuDevices)
-	for idx := range nics {
-		devs[idx] = make(proxmox.QemuDevice)
-		setDeviceParamIfDefined(devs[idx], "model", nics[idx].Model)
-		setDeviceParamIfDefined(devs[idx], "macaddr", nics[idx].MACAddress)
-		setDeviceParamIfDefined(devs[idx], "bridge", nics[idx].Bridge)
-		setDeviceParamIfDefined(devs[idx], "tag", nics[idx].VLANTag)
+func generateProxmoxNetworkAdapters(nics []NICConfig) (*packersdk.MultiError, proxmox.QemuNetworkInterfaces) {
+	var errs *packersdk.MultiError
+	devs := make(proxmox.QemuNetworkInterfaces)
+	for _, nic := range nics {
+
+		idx := proxmox.QemuNetworkInterfaceID(0)
+
+		dev := &proxmox.QemuNetworkInterface{}
+
+		if nic.Model != "" {
+			model := proxmox.QemuNetworkModel(nic.Model)
+			dev.Model = &model
+		}
+
+		if nic.MACAddress != "" {
+			mac, err := net.ParseMAC(nic.MACAddress)
+			if err != nil {
+				errs = packersdk.MultiErrorAppend(errs, fmt.Errorf("Error while parsing mac address %v: %v", nic.MACAddress, err.Error()))
+				continue
+			}
+			dev.MAC = &mac
+		}
+
+		if nic.Bridge != "" {
+			dev.Bridge = &nic.Bridge
+		}
+
+		if nic.VLANTag != "" {
+			vlan, err := strconv.ParseUint(nic.VLANTag, 0, 16)
+			if err != nil {
+				errs = packersdk.MultiErrorAppend(errs, fmt.Errorf("Error while parsing mac address %v: %v", nic.MACAddress, err.Error()))
+				continue
+			}
+			vlans := proxmox.Vlans([]proxmox.Vlan{
+				proxmox.Vlan(vlan),
+			})
+			dev.TaggedVlans = &vlans
+		}
 
 		if nics[idx].Firewall {
-			devs[idx]["firewall"] = nics[idx].Firewall
+			dev.Firewall = &nics[idx].Firewall
 		}
 
 		if nics[idx].MTU > 0 {
-			devs[idx]["mtu"] = nics[idx].MTU
+			mtu := &proxmox.QemuMTU{
+				Inherit: false,
+				Value:   proxmox.MTU(nics[idx].MTU),
+			}
+			dev.MTU = mtu
 		}
 		if nics[idx].PacketQueues > 0 {
-			devs[idx]["queues"] = nics[idx].PacketQueues
+			multiQueues := proxmox.QemuNetworkQueue(nics[idx].PacketQueues)
+			dev.MultiQueue = &multiQueues
 		}
+
+		devs[idx] = *dev
 	}
-	return devs
+	return errs, devs
 }
 
 func generateProxmoxDisks(disks []diskConfig, isos []ISOsConfig, cloneSourceDisks []string) (*packersdk.MultiError, []string, *proxmox.QemuStorages) {
@@ -679,25 +738,72 @@ func generateProxmoxDisks(disks []diskConfig, isos []ISOsConfig, cloneSourceDisk
 	return errs, warnings, &qemuStorages
 }
 
-func generateProxmoxPCIDeviceMap(devices []pciDeviceConfig) proxmox.QemuDevices {
-	devs := make(proxmox.QemuDevices)
-	for idx := range devices {
-		devs[idx] = make(proxmox.QemuDevice)
-		setDeviceParamIfDefined(devs[idx], "host", devices[idx].Host)
-		setDeviceParamIfDefined(devs[idx], "device-id", devices[idx].DeviceID)
-		setDeviceParamIfDefined(devs[idx], "mapping", devices[idx].Mapping)
-		setDeviceParamIfDefined(devs[idx], "mdev", devices[idx].MDEV)
-		setDeviceParamIfDefined(devs[idx], "romfile", devices[idx].ROMFile)
-		setDeviceParamIfDefined(devs[idx], "sub-device-id", devices[idx].SubDeviceID)
-		setDeviceParamIfDefined(devs[idx], "sub-vendor-id", devices[idx].SubVendorID)
-		setDeviceParamIfDefined(devs[idx], "vendor-id", devices[idx].VendorID)
+func generateProxmoxPCIDeviceMap(devices []pciDeviceConfig) (*packersdk.MultiError, []string, proxmox.QemuPciDevices) {
+	var errs *packersdk.MultiError
+	var warnings []string
+	devs := make(proxmox.QemuPciDevices)
+	for _, dev := range devices {
 
-		devs[idx]["pcie"] = strconv.FormatBool(devices[idx].PCIe)
-		devs[idx]["rombar"] = strconv.FormatBool(!devices[idx].HideROMBAR)
-		devs[idx]["x-vga"] = strconv.FormatBool(devices[idx].XVGA)
-		devs[idx]["legacy-igd"] = strconv.FormatBool(devices[idx].LegacyIGD)
+		id, err := strconv.ParseUint(dev.DeviceID, 0, 8)
+		if err != nil {
+			errs = packersdk.MultiErrorAppend(errs, fmt.Errorf("Error while parsing id %v as uint8 for PCI Device Map : %v", dev.DeviceID, err))
+			continue
+		}
+		idx := proxmox.QemuPciID(id)
+		var mapping *proxmox.QemuPciMapping
+		if devices[idx].Host != "" {
+			deviceId := proxmox.PciDeviceID(devices[idx].Host)
+			mapping.DeviceID = &deviceId
+		}
+
+		rombar := !devices[idx].HideROMBAR
+
+		mapping.PCIe = &devices[idx].PCIe
+		mapping.ROMbar = &rombar
+		mapping.PrimaryGPU = &devices[idx].XVGA
+		if devices[idx].LegacyIGD {
+			warnings = append(warnings, fmt.Sprintf("PCI Device %v : LegacyIGD is not ignored in this plugin version", dev.DeviceID))
+		}
+
+		if devices[idx].DeviceID != "" {
+			did := proxmox.PciDeviceID(devices[idx].DeviceID)
+			mapping.DeviceID = &did
+		}
+
+		if devices[idx].MDEV != "" {
+			mdev := proxmox.PciMediatedDevice(devices[idx].MDEV)
+			mapping.MDev = &mdev
+		}
+
+		if devices[idx].ROMFile != "" {
+			warnings = append(warnings, fmt.Sprintf("PCI Device %v : ROMFile is not ignored in this plugin version", dev.DeviceID))
+		}
+
+		if devices[idx].SubDeviceID != "" {
+			subdeviceId := proxmox.PciSubDeviceID(devices[idx].SubDeviceID)
+			mapping.SubDeviceID = &subdeviceId
+		}
+
+		if devices[idx].SubVendorID != "" {
+			subvendorId := proxmox.PciSubVendorID(devices[idx].SubVendorID)
+			mapping.SubVendorID = &subvendorId
+		}
+
+		if devices[idx].VendorID != "" {
+			vendorId := proxmox.PciVendorID(devices[idx].VendorID)
+			mapping.VendorID = &vendorId
+		}
+
+		if devices[idx].Mapping != "" {
+			warnings = append(warnings, fmt.Sprintf("PCI Device %v : This plugin version is ignoring the mapping thing because i dont understand it yet :)", dev.DeviceID))
+
+		}
+
+		devs[idx] = proxmox.QemuPci{
+			Mapping: mapping,
+		}
 	}
-	return devs
+	return errs, warnings, devs
 }
 
 func generateProxmoxSerials(serials []string) proxmox.SerialInterfaces {
@@ -782,13 +888,14 @@ func isDuplicateIDError(err error) bool {
 }
 
 type startedVMCleaner interface {
-	StopVm(*proxmox.VmRef) (string, error)
-	DeleteVm(*proxmox.VmRef) (string, error)
+	StopVm(context.Context, *proxmox.VmRef) (string, error)
+	DeleteVm(context.Context, *proxmox.VmRef) (string, error)
 }
 
 var _ startedVMCleaner = &proxmox.Client{}
 
 func (s *stepStartVM) Cleanup(state multistep.StateBag) {
+	ctx := context.Background()
 	vmRefUntyped, ok := state.GetOk("vmRef")
 	// If not ok, we probably errored out before creating the VM
 	if !ok {
@@ -807,14 +914,14 @@ func (s *stepStartVM) Cleanup(state multistep.StateBag) {
 
 	// Destroy the server we just created
 	ui.Say("Stopping VM")
-	_, err := client.StopVm(vmRef)
+	_, err := client.StopVm(ctx, vmRef)
 	if err != nil {
 		ui.Error(fmt.Sprintf("Error stopping VM. Please stop and delete it manually: %s", err))
 		return
 	}
 
 	ui.Say("Deleting VM")
-	_, err = client.DeleteVm(vmRef)
+	_, err = client.DeleteVm(ctx, vmRef)
 	if err != nil {
 		ui.Error(fmt.Sprintf("Error deleting VM. Please delete it manually: %s", err))
 		return
