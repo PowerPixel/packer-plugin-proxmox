@@ -4,6 +4,7 @@
 package proxmox
 
 import (
+	"context"
 	"crypto/tls"
 	"log"
 	"strings"
@@ -30,7 +31,7 @@ func newProxmoxClient(config Config) (*proxmox.Client, error) {
 	} else {
 		// fallback to login if not using tokens
 		log.Print("using password auth")
-		err = client.Login(config.Username, config.Password, "")
+		err = client.Login(context.Background(), config.Username, config.Password, "")
 		if err != nil {
 			return nil, err
 		}

@@ -4,6 +4,7 @@
 package proxmox
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -134,7 +135,7 @@ func (p *proxmoxDriver) send(key string) error {
 	keys := append(p.specialBuffer, p.normalBuffer...)
 	keys = append(keys, key)
 	keyEventString := bufferToKeyEvent(keys)
-	err := p.client.Sendkey(p.vmRef, keyEventString)
+	err := p.client.Sendkey(context.Background(), p.vmRef, keyEventString)
 	if err != nil {
 		return err
 	}

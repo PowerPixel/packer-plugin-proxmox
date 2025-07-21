@@ -80,7 +80,7 @@ func DownloadISOOnPVE(state multistep.StateBag, ISOUrls []string, ISOChecksum st
 		}
 
 		log.Printf("[INFO] - beginning download of %s to node %s", isoConfig.DownloadUrl, isoConfig.Node)
-		err := proxmox.DownloadIsoFromUrl(client, isoConfig)
+		err := proxmox.DownloadIsoFromUrl(context.Background(), client, isoConfig)
 		// On error continues with the next URL and logs the error
 		if err != nil {
 			log.Printf("[ERROR] - failed to download iso from %s: %s", isoConfig.DownloadUrl, err)
