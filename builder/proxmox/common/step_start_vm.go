@@ -237,7 +237,7 @@ func (s *stepStartVM) Run(ctx context.Context, state multistep.StateBag) multist
 			ui.Say("Generated VM ID was already allocated, retrying")
 			continue
 		}
-		err = fmt.Errorf("Error creating VM: %s", err)
+		err = fmt.Errorf("error creating VM: %s", err)
 		state.Put("error", err)
 		ui.Error(err.Error())
 		return multistep.ActionHalt
@@ -268,7 +268,7 @@ func (s *stepStartVM) Run(ctx context.Context, state multistep.StateBag) multist
 	ui.Say("Starting VM")
 	_, err := client.StartVm(vmRef)
 	if err != nil {
-		err := fmt.Errorf("Error starting VM: %s", err)
+		err := fmt.Errorf("error starting VM: %s", err)
 		state.Put("error", err)
 		ui.Error(err.Error())
 		return multistep.ActionHalt
@@ -318,7 +318,7 @@ func generateProxmoxNetworkAdapters(nics []NICConfig) (*packersdk.MultiError, pr
 		if nic.MACAddress != "" {
 			mac, err := net.ParseMAC(nic.MACAddress)
 			if err != nil {
-				errs = packersdk.MultiErrorAppend(errs, fmt.Errorf("Error while parsing mac address %v: %v", nic.MACAddress, err.Error()))
+				errs = packersdk.MultiErrorAppend(errs, fmt.Errorf("error while parsing mac address %v: %v", nic.MACAddress, err.Error()))
 				continue
 			}
 			dev.MAC = &mac
@@ -331,7 +331,7 @@ func generateProxmoxNetworkAdapters(nics []NICConfig) (*packersdk.MultiError, pr
 		if nic.VLANTag != "" {
 			vlan, err := strconv.ParseUint(nic.VLANTag, 0, 16)
 			if err != nil {
-				errs = packersdk.MultiErrorAppend(errs, fmt.Errorf("Error while parsing mac address %v: %v", nic.MACAddress, err.Error()))
+				errs = packersdk.MultiErrorAppend(errs, fmt.Errorf("error while parsing mac address %v: %v", nic.MACAddress, err.Error()))
 				continue
 			}
 			vlans := proxmox.Vlans([]proxmox.Vlan{
@@ -742,15 +742,26 @@ func generateProxmoxPCIDeviceMap(devices []pciDeviceConfig) (*packersdk.MultiErr
 	var errs *packersdk.MultiError
 	var warnings []string
 	devs := make(proxmox.QemuPciDevices)
-	for _, dev := range devices {
 
-		id, err := strconv.ParseUint(dev.DeviceID, 0, 8)
-		if err != nil {
-			errs = packersdk.MultiErrorAppend(errs, fmt.Errorf("Error while parsing id %v as uint8 for PCI Device Map : %v", dev.DeviceID, err))
-			continue
+	if len(devices) > 15 {
+		warnings = append(warnings, "more than 16 pci devices were declared, only creating the 16 firsts")
+	}
+
+	for i, dev := range devices {
+		idx := proxmox.QemuPciID(i)
+		if i > 15 {
+			break
 		}
-		idx := proxmox.QemuPciID(id)
-		var mapping *proxmox.QemuPciMapping
+		if dev.DeviceID != "" {
+			id, err := strconv.ParseUint(dev.DeviceID, 0, 8)
+			if err != nil {
+				errs = packersdk.MultiErrorAppend(errs, fmt.Errorf("error while parsing id %v as uint8 for PCI Device Map : %v", dev.DeviceID, err))
+				continue
+			}
+			idx = proxmox.QemuPciID(id)
+		}
+
+		mapping := &proxmox.QemuPciMapping{}
 		if devices[idx].Host != "" {
 			deviceId := proxmox.PciDeviceID(devices[idx].Host)
 			mapping.DeviceID = &deviceId

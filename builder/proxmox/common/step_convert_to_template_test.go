@@ -98,8 +98,11 @@ func TestConvertToTemplate(t *testing.T) {
 				t.Errorf("Expected template_id state present=%v was present=%v", c.expectTemplateIdSet, wasSet)
 			}
 
-			if c.expectTemplateIdSet && id != vmid {
-				t.Errorf("Expected template_id state to be set to %d, got %v", vmid, id)
+			if c.expectTemplateIdSet {
+				guestId := id.(proxmox.GuestID)
+				if guestId.String() != fmt.Sprint(vmid) {
+					t.Errorf("Expected template_id state to be set to %d, got %v", vmid, id.(uint32))
+				}
 			}
 		})
 	}

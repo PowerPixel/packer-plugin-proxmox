@@ -459,7 +459,7 @@ func TestStartVM_AssertInitialQuemuConfig(t *testing.T) {
 				},
 			},
 			assertQemuConfig: func(t *testing.T, config proxmox.ConfigQemu) {
-				assert.Equal(t, "true", config.PciDevices[proxmox.QemuPciID0].Raw.ROMbar)
+				assert.Equal(t, true, *config.PciDevices[proxmox.QemuPciID0].Mapping.ROMbar)
 			},
 		},
 	}
